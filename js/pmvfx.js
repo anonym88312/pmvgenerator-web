@@ -101,6 +101,7 @@ export class Compositor {
     this.grain = makeGrain(off(256, 256));
     this.backs = []; // tiny canvases for the blurred border in "Fit" mode (one per field)
     this.lines = makeScanlines(off(4, 4));
+    this.pic = { flash: null, over: null }; // pictures: a flash picture covers the clips for a moment, an overlay lies over them
   }
 
   // The canvas got another size (the window changed shape): the buffers for echo and RGB split follow
@@ -149,6 +150,24 @@ export class Compositor {
     if (!this.fx.text || !this.words.length) return;
     this.t.text = t;
     this.t.word = this.words[Math.floor(Math.random() * this.words.length)];
+  }
+
+  // ---------- Pictures (image flash / image overlay) ----------
+  // pic: { el: ImageBitmap, w, h }, times in show seconds
+  picFlash(pic, t0, t1) {
+    this.pic.flash = { pic, t0, t1 };
+  }
+  picOver(pic, t0, t1, alpha) {
+    this.pic.over = { pic, t0, t1, alpha };
+  }
+  // A picture over the whole frame: it fills when its shape is close to the frame's, else the whole picture sits in the middle
+  // (a flash gets the blurred backdrop like a clip, an overlay stays see-through around it)
+  drawPic(pic, backdrop, zoom, ox, oy) {
+    const s = { x: 0, y: 0, w: this.W, h: this.H };
+    const m = { kind: "image", el: pic.el, w: pic.w, h: pic.h };
+    const fit = Math.max(s.w / s.h / (m.w / m.h), m.w / m.h / (s.w / s.h)) <= SNAP ? "cover" : "contain";
+    if (backdrop && fit === "contain") this.backdrop(15, m, s);
+    drawIn(this.g, m, s, fit, zoom, ox, oy, "", false);
   }
 
   // ---------- One frame ----------
@@ -298,6 +317,27 @@ export class Compositor {
       g.restore();
     }
 
+    // Pictures: an overlay lies over the clips, see-through, fading in and out; a flash picture covers them for a moment
+    const po = this.pic.over;
+    if (po) {
+      if (t >= po.t1) this.pic.over = null;
+      else if (t >= po.t0) {
+        g.save();
+        g.globalAlpha = po.alpha * Math.max(0, Math.min(1, (t - po.t0) / 0.15, (po.t1 - t) / 0.15));
+        this.drawPic(po.pic, false, 1 + pulse * 0.6, dx, dy);
+        g.restore();
+      }
+    }
+    const pf = this.pic.flash;
+    let picOn = false;
+    if (pf) {
+      if (t >= pf.t1) this.pic.flash = null;
+      else if (t >= pf.t0) {
+        picOn = true;
+        this.drawPic(pf.pic, true, 1 + pulse, dx, dy);
+      }
+    }
+
     // Color look: tint over everything, noir with dark corners
     if (this.lookTint) {
       g.globalCompositeOperation = "soft-light";
@@ -317,7 +357,7 @@ export class Compositor {
     if (this.S.edge && this.S.edge !== "off") this.edgeSoft(this.S.edge, Math.max(0, Math.min(1, (this.S.edgeAmt ?? 50) / 100)));
 
     // Dividers between fields, glowing to the beat – width from the setting (2 px at 720p, 3 px at 1080p by default); none with soft seams
-    if (st.slots.length > 1 && !softOn) {
+    if (st.slots.length > 1 && !softOn && !picOn) {
       const dw = Math.max(1, Math.round((this.S.divW || 2) * W / 1280));
       const h2 = dw / 2;
       const glow = Math.exp(-(t - st.beatT) * 7);

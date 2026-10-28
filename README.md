@@ -1,4 +1,4 @@
-# PMV Generator – web version (2.28.10)
+# PMV Generator – web version (2.38.7)
 
 Pick a song and a folder of clips – on every beat it cuts to the next one: split-screen layouts like real PMVs, effects on cuts, beats and drops, beat-synced speed ramps and clip audio. It runs live in the browser and can record the result as a video. It can also analyze an existing PMV and rebuild it with your own clips.
 
@@ -29,6 +29,7 @@ Everything runs locally in your browser – the author never receives, sees, sto
    - **What**: videos, images or both · **Clip shape**: all, portrait only, landscape only.
    - **Folders**: limit the clips to some of the added folders.
    - **Clip selection**: best moments instead of random spots, **clean cuts** (a clip starts where its scene runs on for the next few seconds – no hidden scene change inside the clip), smart crop, match cuts, variety.
+     Also: **Skip the start / the end of each video** (no clips from logos and credits), **Clip speed follows the music** (fast, busy music gets clips with fast motion – experimental) and **Motion on the beat** (a clip's rhythm is measured and lined up with the beat – experimental).
 3. **Style**: mood presets (*PMV classic*, *Maximal*, *Hypno*, *Clean*) and five sections – cutting and layouts (fullscreen, kaleidoscope, 2-way, 3-way mirrored, 3-way, 4-way), effects on cuts / beats / drops, look & picture (color look, 16:9 or 9:16, **Fit** shows the whole clip with a blurred border, **Fill** crops it to fill the frame), song and clip volume, intro/outro and recording quality (720p/1080p). All sections are open; click a section's header to collapse it, or use **Collapse all**. **Bars and phrases** (under Cutting) finds the “one” of each bar and where a 4-bar phrase starts: cuts sit on the bar's strong beats and split screens change at the start of a phrase.
 4. **Go**: runs as a fullscreen show (Space pause, F fullscreen, Esc stop; with several songs N / P or the buttons in the bar skip). The bar and the mouse pointer disappear after 2.5 s without movement; **H** hides the bar for good (H again brings it back). **I** shows which clips are on screen (file, size, playing / loading / black picture) and which had to be skipped and why – clips the browser can't decode are left out instead of showing a black field. 4K clips run smoothly: the picture analysis runs in the background and every clip frame reaches the screen, also on 144/240 Hz monitors. With **Record** you get a WebM video to download – the duration is written into the file right in the browser, so players show the length and can seek.
 
@@ -37,6 +38,12 @@ Everything runs locally in your browser – the author never receives, sees, sto
    **Funscript** (optional): builds a script for The Handy from the song and plays it with the PMV – enter your connection key under Funscript (kept in this browser only).
 
    **Soften the seams** (Look): in a split screen the line between the clips is soft instead of sharp.
+
+   **Pictures**: still images from your library flash between the clips (**Image flash**: one or a burst, up to eight per beat, in a tempo of their own) or lie see-through over them (**Image overlay**) – add image files or a folder with images to the library.
+
+   **Change the moment** (key **M** or the pencil in the bar): the show pauses and every clip gets a slider to take it from another moment of its video; **Pin this moment** makes clips of that video often start there (kept in this browser).
+
+   **Mouse control**: run the show with the mouse – click the middle to pause, the sides for song volume or the previous / next song, the wheel and the middle button too (all off by default); **Start by itself** starts right after you pick a song.
 
 The clips you add are kept only while the page is open – after a reload, add the folder again (your folder choice and all settings are remembered).
 

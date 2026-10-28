@@ -11,7 +11,7 @@ import { buildFunscript, FS_DEFAULTS } from "../funscriptgen.js";
 import { attachHandy, getHandy, interactiveConfig, saveInteractiveConfig } from "../interactive.js";
 import { analyzeFile, analyzeBuffer, sliceBuffer, songFromFrames, rescale, shift } from "../beats.js";
 import { scanPmv } from "../pmvscan.js";
-import { analyzeAsync, spotScore, matchDist, isCut } from "../pmvsmart.js";
+import { analyzeAsync, spotScore, matchDist, isCut, motion } from "../pmvsmart.js";
 import { analyzeBars } from "../bars.js";
 import { folderPicker } from "./folderpick.js";
 import { LAYOUTS, slotsFor, aspectOfGroup, Compositor } from "../pmvfx.js";
@@ -48,6 +48,8 @@ const DEFAULTS = {
   shape: "all", // clip shape: all | portrait | landscape
   layoutShape: {}, // clip shape per layout (layout id → all | portrait | landscape), missing = all
   bestSpots: true, // best moments instead of random
+  paceMatch: false, // clip speed follows the music: fast music gets clips with fast motion (the speed of each spot is measured while the clip is prepared)
+  beatSync: false, // motion on the beat: each clip's rhythm is measured while preparing and lined up with the beat (experimental)
   cleanCuts: true, // a clip's start has no scene change in the first seconds (it would cut by itself)
   smartCrop: true, // crop follows what matters
   variety: true, // same clip not shortly after itself
@@ -61,17 +63,36 @@ const DEFAULTS = {
   // Effects: a calm start – zoom-in entry, flash, zoom pulse and RGB split; the rest is opt-in
   fx: { flash: true, zoom: true, shake: false, glitch: false, stutter: false, hue: false, rgb: true, echo: false, tunnel: false, invert: false, whip: false, zoomin: true, speed: false, voice: true, vhs: false, strobe: false, text: false, kenburns: true, lines: true },
   words: "",
+  // Pictures: still images from your library that flash between the clips or lie over them
+  picFlash: false, // image flash: a picture covers the clips for a moment, in a tempo of its own
+  picFlashRate: "auto", // pictures per beat: auto (follows the song) | 1 | 2 | 4 | 8
+  picFlashMode: "both", // one picture | a burst of pictures | both
+  picFlashLen: 2, // a burst lasts this many beats
+  picFlashPct: 20, // share of beats that start a flash
+  picOverlay: false, // image overlay: a picture lies over the playing clips, see-through
+  picOverlayAmt: 35, // how solid it is (%)
+  picOverlayLen: 4, // for this many beats
+  picOverlayPct: 30, // share of bars that get an overlay
   look: "none", // color look: none | warm | pink | cold | bw | noir | vivid | custom
   lookAmt: 100, // strength of the look (%)
   lookColor: "#ff4d94", // the tint of the "custom" look
   bright: 0, // smooth extra brightness (%)
   soft: false, // soft seams: the fields of a split screen blend into each other
   softAmt: 50, // how wide the blend is (%)
+  skipHead: 0, // seconds at the start of every video that no clip is taken from (on top of the automatic intro skip)
+  skipTail: 0, // … and at the end
   divW: 2, // width of the dividers between the fields (px at 1280 wide, scales with the picture)
   cutLead: 0, // cuts land this many ms before the beat (the picture is a touch early, which feels tighter)
   minBeats: 0, // a clip stays at least this many beats before its field is cut again (0 = off)
   maxBeats: 0, // … and is replaced after at most this many beats (0 = off)
   reshuffleEach: false, // several songs / Plex: new clips for every new song
+  autoStart: false, // starts by itself as soon as a song has been picked (or a Plex playlist is set)
+  mWheel: "off", // mouse wheel while it plays: off | song (next / previous song) | volume (song volume)
+  mWheelRev: false, // … the other way round
+  mMid: false, // a click in the middle of the picture pauses / plays
+  mSidesMode: "off", // a click on the left / right third of the picture: off | song (previous / next song) | volume (song volume)
+  mSidesRev: false, // … left = louder, right = quieter
+  mShuffle: false, // the middle mouse button reshuffles the clips
   introEach: false, // several songs / Plex: intro and outro come again for every song
   edge: "off", // rim of the picture: off | blur | motion | lens
   edgeAmt: 50, // how strong / how far in (%)
@@ -148,9 +169,11 @@ const CUTS = [
 const SECTIONS = [
   ["cut", "Cutting", "When to cut and which split screens"],
   ["fx", "Effects", "What happens on cuts, beats and drops"],
+  ["pics", "Pictures", "Images that flash between the clips or lie over them"],
   ["look", "Color & look", "Color mood, brightness and film effects"],
   ["frame", "Picture & frame", "Format, fit, seams and edges"],
   ["sound", "Sound", "Song and clip volume"],
+  ["mouse", "Mouse control", "Run the show with the mouse alone"],
   ["fs", "Funscript", "A script for The Handy that follows the song"],
   ["out", "Output", "Intro, outro and recording"],
 ];
@@ -181,6 +204,7 @@ export function render(main) {
   S.fx = Object.assign({}, DEFAULTS.fx, S.fx);
   S.layouts = Object.assign({}, DEFAULTS.layouts, S.layouts);
   S.collapsed = Object.assign({}, S.collapsed);
+  if (!S.mSidesMode) S.mSidesMode = "off";
   // Settings from before version 2 had "Fill" as default – people took the cropping for a bug
   if (!stored.v) S.fit = "contain";
   if (!Array.isArray(S.folders)) S.folders = [];
@@ -317,9 +341,13 @@ export function render(main) {
         <span class="kb-lab-t">Clip selection <small>– which part of a scene is taken</small></span>
         <div class="kb-pmvg-opts">
           ${sw("bestSpots", "Best moments instead of random", "Looks at several spots per video (motion, skin, contrast) and takes the best one")}
+          ${sw("paceMatch", "Clip speed follows the music (experimental)", "Fast, busy music gets clips with fast motion, calm music slow ones. Measures how fast the motion is at the spot a clip is taken from – the more clips have been prepared, the better it knows your library")}
+          ${sw("beatSync", "Motion on the beat (experimental)", "Measures the rhythm of the motion in each clip and lines it up with the beat – a clip comes in on a turn of the motion and plays up to 12 % faster or slower. Clips take about 1 s longer to prepare; works best with steady, repeating motion, a still camera and clips that stay on for a few beats")}
           ${sw("cleanCuts", "Clean cuts", "With best moments: a clip starts where its scene runs on for the next few seconds – no hidden cut inside the clip that jumps to another scene by itself")}
           ${sw("smartCrop", "Smart crop", "The crop follows what matters in the clip instead of sticking to the center")}
         </div>
+        <label class="kb-pmvg-range" title="No clip is taken from the first seconds of a video (studio logo, titles). On top of the automatic skip of the intro; 0 = automatic only"><span>${icon("sliders")}Skip the start of each video</span><input type="range" min="0" max="300" step="5" data-r="skipHead" aria-label="Skip the start of each video"><output data-ro="skipHead" data-unit=" s"></output></label>
+        <label class="kb-pmvg-range" title="No clip is taken from the last seconds of a video (credits, outro). 0 = off"><span>${icon("sliders")}Skip the end of each video</span><input type="range" min="0" max="300" step="5" data-r="skipTail" aria-label="Skip the end of each video"><output data-ro="skipTail" data-unit=" s"></output></label>
         <span class="kb-lab-t">Clip order <small>– which clip follows which</small></span>
         <div class="kb-pmvg-opts">
           ${sw("matchCut", "Match cuts", "At each cut, the clip that best matches the previous one in color, brightness and composition comes next")}
@@ -393,6 +421,34 @@ export function render(main) {
                 <div class="kb-pmvg-opts">${keys.map(fxSw).join("")}</div>
                 ${keys.includes("text") ? `<input class="kb-field kb-pmvg-words" data-words placeholder="Words for “Text”, comma separated – e.g. DROP, MORE, YES" value="${esc(S.words)}">` : ""}
               </div>`).join("")}
+          </div>
+        </div>
+
+        <div class="kb-pmvg-sec" data-sec="pics">
+          ${secHead("pics")}
+          <div class="kb-pmvg-pane" id="pmvg-pane-pics" data-pane="pics">
+            <p class="kb-hint">Still images from your library, on top of the clips – in a tempo of their own. Needs images in the library (add image files or a folder with images); the clips can be videos only.</p>
+            <div class="kb-pmvg-group">
+              <div class="kb-pmvg-grouphead"><b>Image flash</b><small>Pictures cover the clips for a moment</small></div>
+              <div class="kb-pmvg-opts">${sw("picFlash", "Image flash", "Pictures flash up on the beat – up to eight per beat")}</div>
+              <div data-flashbox>
+                <span class="kb-lab-t">Speed <small>– pictures per beat</small></span>
+                <div class="kb-seg" data-seg="picFlashRate"><button type="button" data-v="auto" title="Calm parts one per beat, louder parts two, loud parts four">Follow the song</button><button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="4">4</button><button type="button" data-v="8">8</button></div>
+                <span class="kb-lab-t">How</span>
+                <div class="kb-seg" data-seg="picFlashMode"><button type="button" data-v="single" title="One picture, as long as one step of the speed above">One picture</button><button type="button" data-v="burst" title="Several pictures in a row, as many as fit in the burst length">A burst</button><button type="button" data-v="both">Both</button></div>
+                <label class="kb-pmvg-range" title="How long a burst of pictures lasts"><span>${icon("sliders")}Burst length</span><input type="range" min="1" max="8" step="1" data-r="picFlashLen" aria-label="Burst length in beats"><output data-ro="picFlashLen" data-unit=" beats"></output></label>
+                <label class="kb-pmvg-range" title="How many of the beats start a flash – the rest of the time only the clips play"><span>${icon("sliders")}How often</span><input type="range" min="5" max="100" step="5" data-r="picFlashPct" aria-label="How often pictures flash"><output data-ro="picFlashPct"></output></label>
+              </div>
+            </div>
+            <div class="kb-pmvg-group">
+              <div class="kb-pmvg-grouphead"><b>Image overlay</b><small>A picture lies over the playing clips</small></div>
+              <div class="kb-pmvg-opts">${sw("picOverlay", "Image overlay", "A see-through picture fades in over the clips and out again")}</div>
+              <div data-overlaybox>
+                <label class="kb-pmvg-range" title="How solid the picture is"><span>${icon("sliders")}Opacity</span><input type="range" min="10" max="90" step="5" data-r="picOverlayAmt" aria-label="Opacity of the overlay"><output data-ro="picOverlayAmt"></output></label>
+                <label class="kb-pmvg-range" title="How long a picture stays"><span>${icon("sliders")}Length</span><input type="range" min="1" max="16" step="1" data-r="picOverlayLen" aria-label="Length of the overlay in beats"><output data-ro="picOverlayLen" data-unit=" beats"></output></label>
+                <label class="kb-pmvg-range" title="How many of the bars get an overlay"><span>${icon("sliders")}How often</span><input type="range" min="5" max="100" step="5" data-r="picOverlayPct" aria-label="How often there is an overlay"><output data-ro="picOverlayPct"></output></label>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -478,6 +534,22 @@ export function render(main) {
           </div>
         </div>
 
+        <div class="kb-pmvg-sec" data-sec="mouse">
+          ${secHead("mouse")}
+          <div class="kb-pmvg-pane" id="pmvg-pane-mouse" data-pane="mouse">
+            <div class="kb-pmvg-opts">
+              ${sw("mMid", "Click the middle: play / pause", "A click on the middle third of the picture")}
+              ${sw("mShuffle", "Middle mouse button: new clips", "Same as the R key")}
+            </div>
+            <span class="kb-lab-t">Click the sides</span>
+            <div class="kb-seg" data-seg="mSidesMode"><button type="button" data-v="off">Off</button><button type="button" data-v="song" title="Right third = next song, left = previous (only with several songs)">Next / previous song</button><button type="button" data-v="volume" title="Right third louder, left third quieter (5 % per click)">Song volume</button></div>
+            <div class="kb-pmvg-opts">${sw("mSidesRev", "Sides the other way round", "Left = next song / louder, right = previous song / quieter")}</div>
+            <span class="kb-lab-t">Mouse wheel</span>
+            <div class="kb-seg" data-seg="mWheel"><button type="button" data-v="off">Off</button><button type="button" data-v="song" title="Wheel down = next song, up = previous (only with several songs)">Next / previous song</button><button type="button" data-v="volume">Song volume</button></div>
+            <div class="kb-pmvg-opts">${sw("mWheelRev", "Reverse the wheel", "Turns it round: wheel down = previous song / louder, wheel up = next song / quieter")}</div>
+          </div>
+        </div>
+
         <div class="kb-pmvg-sec" data-sec="fs">
           ${secHead("fs")}
           <div class="kb-pmvg-pane" id="pmvg-pane-fs" data-pane="fs">
@@ -509,6 +581,7 @@ export function render(main) {
               ${sw("intro", "Intro", "Title card at the start: your title slams in, comic-SFX style")}
               ${sw("outro", "Outro", "Credits at the end: the picture fades dark, title and number of clips")}
               ${sw("introEach", "Again for every song", "With several songs or Plex: intro and outro come again for each song (the outro when a song plays to its end)")}
+              ${sw("autoStart", "Start by itself", "Starts as soon as it can – when the page opens with a Plex playlist set, or right after you pick a song – with the settings as you left them")}
             </div>
             <input class="kb-field" data-title placeholder="Title for intro/outro – empty = song name" value="${esc(S.title)}">
             </div>
@@ -529,7 +602,7 @@ export function render(main) {
         <h2><span class="kb-pmvg-no">4</span>Go</h2>
         <ul class="kb-pmvg-sum" data-sum></ul>
         <button class="kb-btn is-primary kb-pmvg-start" data-start disabled>${icon("bolt")}Pick a song first</button>
-        <p class="kb-hint">Keys while it runs: Space pause · R new clips · F fullscreen · H hide the bar · I clip info · Esc stop</p>
+        <p class="kb-hint">Keys while it runs: Space pause · R new clips · F fullscreen · H hide the bar · I clip info · M change a clip's moment · Esc stop</p>
         <div class="kb-pmvg-presets">
           <span class="kb-lab-t">My settings</span>
           <div class="kb-pmvg-row">
@@ -592,6 +665,8 @@ export function render(main) {
       const v = S[o.dataset.ro];
       o.textContent = !+v && o.dataset.zero != null ? o.dataset.zero : v + (o.dataset.unit ?? " %");
     });
+    $("[data-flashbox]").classList.toggle("is-dim", !S.picFlash);
+    $("[data-overlaybox]").classList.toggle("is-dim", !S.picOverlay);
     // Without clip audio, clip volume and "when" have no effect
     ["[data-clipvol]", "[data-seg=voiceMode]", "[data-voicewhen]"].forEach((q) => $(q).classList.toggle("is-dim", !S.fx.voice));
     $("[data-voicehint]").textContent = !S.fx.voice
@@ -610,14 +685,16 @@ export function render(main) {
     const tabSum = {
       cut: `${CUTS.find(([v]) => v === S.cut)[1]} · ${lays} ${lays === 1 ? "layout" : "layouts"}`,
       fx: `${fxOn} on`,
+      pics: [S.picFlash && "flash", S.picOverlay && "overlay"].filter(Boolean).join(" · ") || "off",
       look: look,
       frame: `${S.format === "window" ? "window shape" : S.format} · ${S.fit === "cover" ? "fill" : "fit"}${S.soft ? " · soft seams" : ""}`,
       sound: `Song ${S.songVol} · Clips ${S.fx.voice ? S.clipVol : "off"}`,
+      mouse: [S.mMid, S.mShuffle, S.mSidesMode !== "off", S.mWheel && S.mWheel !== "off"].filter(Boolean).length ? `${[S.mMid, S.mShuffle, S.mSidesMode !== "off", S.mWheel && S.mWheel !== "off"].filter(Boolean).length} on` : "off",
       fs: S.fsOn ? `${S.fsPace === "auto" ? "follows the song" : S.fsPace} · ${S.fsSize === "auto" ? "auto size" : S.fsSize}` : "off",
       out: [S.intro && "Intro", S.outro && "Outro", S.record && "Recording"].filter(Boolean).join(" · ") || "live only",
     };
     main.querySelectorAll("[data-tabsum]").forEach((s) => (s.textContent = tabSum[s.dataset.tabsum]));
-    const clipOpts = [S.bestSpots && "best moments", S.cleanCuts && "clean cuts", S.smartCrop && "smart crop", S.matchCut && "match cuts", S.sequenced && "scene timeline", S.variety && "variety"].filter(Boolean);
+    const clipOpts = [S.bestSpots && "best moments", S.paceMatch && "clip speed follows the music", S.beatSync && "motion on the beat", S.cleanCuts && "clean cuts", S.smartCrop && "smart crop", S.matchCut && "match cuts", S.sequenced && "scene timeline", S.variety && "variety"].filter(Boolean);
     const src = { scene: "Videos", image: "Images", both: "Videos + images" }[S.source];
     const where = S.folders.length ? `from ${S.folders.length === 1 ? "1 folder" : S.folders.length + " folders"}` : "from all folders";
     $("[data-sum]").innerHTML = [
@@ -966,12 +1043,17 @@ export function render(main) {
   };
 
   const canStart = () => (S.mode === "tpl" ? !!tpl : S.mode === "plex" ? !!plex && (S.plexWhat !== "list" || !!S.plexList) : !!song);
+  var autoDone = false; // "Start by itself": once per visit of the page
   function paintStart() {
     if (starting) return;
     const ok = canStart();
     const clips = lib.all().length > 0;
     const b = $("[data-start]");
     b.disabled = !ok || !clips;
+    if (ok && clips && S.autoStart && !autoDone && !waiting) {
+      autoDone = true;
+      setTimeout(() => canStart() && lib.all().length && !starting && startRun(), 900);
+    }
     const label =
       S.mode === "tpl"
         ? ok ? "Rebuild with my clips" : "Pick a PMV first"
@@ -984,7 +1066,7 @@ export function render(main) {
   // ---------- My settings (presets) ----------
   // Everything about clips, cutting, effects, look and sound – not the music source or the title.
   // Kept in this browser; Export/Import moves them as a file.
-  const NOT_IN_PRESET = ["collapsed", "glass", "v", "mode", "title", "shuffle", "plexWhat", "plexList", "plexSync", "plexSyncs", "liveApp"];
+  const NOT_IN_PRESET = ["autoStart", "mWheel", "mWheelRev", "mMid", "mSidesMode", "mSidesRev", "mShuffle", "collapsed", "glass", "v", "mode", "title", "shuffle", "plexWhat", "plexList", "plexSync", "plexSyncs", "liveApp"];
   const presets = () => store.get("presets", {});
   function writePresets(all) {
     store.set("presets", all);
@@ -1510,6 +1592,313 @@ function drawWave(canvas, song, bars = null) {
   song.beats.forEach((t, k) => (bars ? bars.downbeat[k] : k % 4 === 0) && c.fillRect((t / song.duration) * W, 0, 1, 8));
 }
 
+// Where a video's intro (studio logo, titles) is surely over: picked spots start after it.
+// 3 min → 15 s, 10 min → 24 s, longer → 30 s; short clips a tenth
+// "Skip the start / the end of each video" (Clip selection) adds to that: skipS = [seconds at the start, seconds at the end],
+// never more than 40 % of a video each
+const skipS = [0, 0];
+const introEnd = (dur) => (dur > 10 ? Math.max(Math.min(30, Math.max(dur * 0.04, Math.min(15, dur * 0.1))), Math.min(skipS[0], dur * 0.4)) : 0);
+const tailX = (dur) => (dur > 10 ? Math.min(skipS[1], dur * 0.4) : 0);
+
+// ---------- Motion on the beat ----------
+// The rhythm in a motion curve [{ t, m }] (seconds, motion per second; from frame differences)
+// → { period, turn, q }: seconds per motion pulse, a time where the motion turns (least motion – with
+// back-and-forth motion the turns are the "hits", two per movement) and how clear the rhythm is (0–1);
+// null without a clear rhythm.
+const RHYTHM_DT = 1 / 30;
+function rhythmOf(pts) {
+  if (pts.length < 30) return null;
+  // Evenly spaced (frames can be dropped or come at 24/25/60 fps)
+  const t0 = pts[0].t;
+  const n = Math.floor((pts[pts.length - 1].t - t0) / RHYTHM_DT) + 1;
+  const x = new Float64Array(n);
+  for (let i = 0, j = 0; i < n; i++) {
+    const t = t0 + i * RHYTHM_DT;
+    while (j < pts.length - 2 && pts[j + 1].t < t) j++;
+    const a = pts[j];
+    const b = pts[j + 1];
+    const f = b.t > a.t ? Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t))) : 0;
+    x[i] = a.m + (b.m - a.m) * f;
+  }
+  const mean = x.reduce((s, v) => s + v, 0) / n;
+  for (let i = 0; i < n; i++) x[i] -= mean;
+  const sd = Math.sqrt(x.reduce((s, v) => s + v * v, 0) / n);
+  if (mean < 0.3 || sd / mean < 0.15) return null; // hardly any motion (a still picture), or motion without ups and downs
+  // Autocorrelation over 0.2–0.9 s; the shortest lag that is nearly as strong as the strongest
+  // (multiples of the period correlate too)
+  const lo = Math.round(0.2 / RHYTHM_DT);
+  const hi = Math.min(Math.round(0.9 / RHYTHM_DT), Math.floor(n * 0.6));
+  if (hi <= lo + 2) return null;
+  const corr = (L) => {
+    let s = 0;
+    let ea = 0;
+    let eb = 0;
+    for (let i = 0; i + L < n; i++) {
+      s += x[i] * x[i + L];
+      ea += x[i] * x[i];
+      eb += x[i + L] * x[i + L];
+    }
+    return ea && eb ? s / Math.sqrt(ea * eb) : 0;
+  };
+  const r = [];
+  for (let L = lo - 1; L <= hi + 1; L++) r[L] = corr(L);
+  // A peak at L, between whole frames (parabola through its neighbours)
+  const peakAt = (L) => {
+    const den = r[L - 1] - 2 * r[L] + r[L + 1];
+    return L + (den ? Math.max(-0.5, Math.min(0.5, (0.5 * (r[L - 1] - r[L + 1])) / den)) : 0);
+  };
+  // The highest of L-1…L+1 if it is a peak (a lag between two frames falls on either)
+  const peakNear = (L) => {
+    let k = L;
+    for (const j of [L - 1, L + 1]) if (r[j] != null && r[j] > r[k]) k = j;
+    return r[k - 1] != null && r[k + 1] != null && r[k] >= r[k - 1] && r[k] >= r[k + 1] ? k : -1;
+  };
+  let top = 0;
+  for (let L = lo; L <= hi; L++) top = Math.max(top, r[L]);
+  if (top < 0.35) return null;
+  let lag = -1;
+  for (let L = lo; L <= hi; L++) {
+    if (r[L] >= 0.8 * top && r[L] >= r[L - 1] && r[L] >= r[L + 1]) {
+      lag = L;
+      break;
+    }
+  }
+  if (lag < 0) return null;
+  let period = peakAt(lag) * RHYTHM_DT;
+  // Finer: the peak near twice the lag measures two periods with the same frame step (if it fits in the window).
+  // Searched a few frames around it – with a flat top the first peak can sit a frame off
+  if (2 * lag + 4 < n * 0.75) {
+    for (let L = 2 * lag - 4; L <= 2 * lag + 4; L++) r[L] = r[L] ?? corr(L);
+    let k = 2 * lag - 3;
+    for (let L = k + 1; L <= 2 * lag + 3; L++) if (r[L] > r[k]) k = L;
+    if (r[k] >= 0.25 && r[k] >= r[k - 1] && r[k] >= r[k + 1]) {
+      const p2 = (peakAt(k) * RHYTHM_DT) / 2;
+      if (Math.abs(p2 - period) < 1.6 * RHYTHM_DT) period = p2;
+    }
+  }
+  // The two halves of a back-and-forth often differ (one way faster, other light behind) – then the strongest
+  // lag is the whole movement; its half counts as well if it is a rhythm of its own
+  const h = Math.round(lag / 2);
+  const hk = h - 1 >= lo - 1 ? peakNear(h) : -1;
+  const half = hk >= lo && r[hk] >= 0.3 ? period / 2 : null;
+  // Phase from the curve's fundamental, around the middle of the stretch (a small error in the period
+  // grows towards the ends): a turn is half a pulse after where the motion is most. Taken at the pulse
+  // (the half, if there is one – at the whole movement the fundamental would point between the turns)
+  const pulse = half || period;
+  const mid = (n - 1) / 2;
+  let c = 0;
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    const w = (2 * Math.PI * (i - mid) * RHYTHM_DT) / pulse;
+    c += x[i] * Math.cos(w);
+    s += x[i] * Math.sin(w);
+  }
+  const most = Math.atan2(s, c) / (2 * Math.PI) * pulse;
+  return { period, half, turn: t0 + mid * RHYTHM_DT + most + pulse / 2, q: top };
+}
+
+// Speed factor that puts motion pulses of `period` on the beat: one pulse per beat, two, or one per two beats –
+// whichever needs the least change, at most ±12 % (more looks wrong); null if none fits
+function beatFit(period, bpm) {
+  const beat = 60 / bpm;
+  let rate = null;
+  for (const k of [1, 2, 0.5]) {
+    const f = (period * k) / beat; // > 1: play faster
+    if (f >= 0.88 && f <= 1.12 && (rate == null || Math.abs(f - 1) < Math.abs(rate - 1))) rate = f;
+  }
+  return rate;
+}
+
+// Plays a video (muted, in the pool, at `speed` – the frames keep their own times) for `secs` of it from
+// where it stands and measures every frame → [{ t, a }] in time order (a = analyzeAsync of the frame)
+async function captureFrames(v, secs, speed = 1) {
+  if (!v.requestVideoFrameCallback) return [];
+  const from = v.currentTime;
+  const jobs = [];
+  v.playbackRate = speed;
+  await new Promise((res) => {
+    const stop = setTimeout(res, (secs / speed + 2) * 1000); // (a stalled video mustn't hold up the clip)
+    const onFrame = (now, meta) => {
+      if (meta.mediaTime >= from + secs) {
+        clearTimeout(stop);
+        return res();
+      }
+      const t = meta.mediaTime;
+      jobs.push(analyzeAsync(v, v.videoWidth, v.videoHeight).then((a) => ({ t, a })));
+      v.requestVideoFrameCallback(onFrame);
+    };
+    v.requestVideoFrameCallback(onFrame);
+    v.play().catch(() => {
+      clearTimeout(stop);
+      res();
+    });
+  });
+  v.pause();
+  v.playbackRate = 1;
+  return (await Promise.all(jobs)).filter((x) => x.a && x.a.gray).sort((x, y) => x.t - y.t);
+}
+
+// Motion per second between neighbouring frames → [{ t, m }]; null on a cut (a scene change mixes two motions)
+function motionCurve(fr) {
+  const pts = [];
+  for (let i = 1; i < fr.length; i++) {
+    const dt = fr[i].t - fr[i - 1].t;
+    if (dt <= 0) continue;
+    if (isCut(fr[i - 1].a, fr[i].a)) return null;
+    pts.push({ t: (fr[i].t + fr[i - 1].t) / 2, m: motion(fr[i - 1].a, fr[i].a) / dt });
+  }
+  return pts;
+}
+const meanSpeed = (pts) => (pts && pts.length >= 5 ? pts.reduce((s, p) => s + p.m, 0) / pts.length : null);
+
+// Width of the small measuring picture analyzeAsync makes (pmvsmart's tiny(): 64 px on the long side)
+const grayW = (w, h) => Math.max(8, Math.round(w >= h ? 64 : (64 * w) / h));
+// Shifts to try (± px), the near ones first: the right one is usually near, the far ones then stop early
+const shifts = (rx, ry) => {
+  const l = [];
+  for (let dy = -ry; dy <= ry; dy++) for (let dx = -rx; dx <= rx; dx++) l.push([dx, dy]);
+  return l.sort((p, q) => Math.abs(p[0]) + Math.abs(p[1]) - Math.abs(q[0]) - Math.abs(q[1]));
+};
+const CAM_SHIFTS = shifts(6, 4);
+const BLOCK_SHIFTS = shifts(12, 12);
+// How fast what is in the picture moves – not the camera, not how much of the picture it fills or how much
+// contrast it has. Block matching on the small measuring picture: first the camera (the best shift of the
+// whole frame), then for each 4×4 block with some texture how far it moved on top of that – up to 12 px of 64,
+// so fast motion between the frames of a preview played at 4× still counts (up to 6 px it hit the limit there:
+// very fast measured like fast, or even slower). The whole picture counts, its edges too (a block there only
+// looks where the picture goes on). The fastest 6 % of the blocks with texture count – a fast hand in a wide
+// shot is a small part of the picture → pixels (of 64) per frame step
+function actionMotion(a, b, w) {
+  const h = Math.floor(a.length / w);
+  const B = 4; // block size
+  if (w < 4 * B || h < 4 * B) return 0;
+  // The camera: the shift that fits the whole frame best (every 2nd pixel of the middle)
+  let cb = Infinity;
+  let cx = 0;
+  let cy = 0;
+  for (const [dx, dy] of CAM_SHIFTS) {
+    let s = 0;
+    for (let y = 4; y < h - 4 && s < cb; y += 2) for (let x = 6; x < w - 6; x += 2) s += Math.abs(a[y * w + x] - b[(y + dy) * w + x + dx]);
+    if (s < cb) [cb, cx, cy] = [s, dx, dy];
+  }
+  // A block's difference at a shift (Infinity where it leaves the picture); stops once it reaches `max`
+  const diff = (x0, y0, dx, dy, max) => {
+    if (x0 + dx < 0 || y0 + dy < 0 || x0 + dx + B > w || y0 + dy + B > h) return Infinity;
+    let s = 0;
+    for (let y = y0; y < y0 + B && s < max; y++) {
+      const r = y * w;
+      const k = (y + dy) * w + dx;
+      for (let x = x0; x < x0 + B; x++) s += Math.abs(a[r + x] - b[k + x]);
+    }
+    return s;
+  };
+  const mags = [];
+  for (let y0 = 0; y0 + B <= h; y0 += B) {
+    for (let x0 = 0; x0 + B <= w; x0 += B) {
+      let tex = 0;
+      for (let y = y0; y < y0 + B; y++) for (let x = x0; x < x0 + B; x++) tex += Math.abs(a[y * w + Math.min(w - 1, x + 1)] - a[y * w + x]) + Math.abs(a[Math.min(h - 1, y + 1) * w + x] - a[y * w + x]);
+      if (tex < B * B * 6) continue; // flat: where it went can't be told
+      const still = diff(x0, y0, cx, cy, Infinity);
+      if (still === Infinity) continue; // (the camera moved it out of the picture)
+      // Only a clearly better place counts as a move (noise finds some "better" place anywhere, and along an edge
+      // every place up or down fits about the same) – so a block that hardly changed needs no search at all.
+      // A far place has to fit a little better than a near one (2 per pixel of way), else noise wins out there
+      let bc = Math.min(0.7 * still, still - B * B * 5);
+      let mx = 0;
+      let my = 0;
+      let moved = false;
+      for (const [dx, dy] of BLOCK_SHIFTS) {
+        const pen = 2 * (Math.abs(dx) + Math.abs(dy));
+        if (pen >= bc) break; // (sorted by way: none further out can win)
+        const s = diff(x0, y0, cx + dx, cy + dy, bc - pen);
+        if (s + pen < bc) [bc, mx, my, moved] = [s + pen, dx, dy, true];
+      }
+      mags.push(moved ? Math.hypot(mx, my) : 0);
+    }
+  }
+  if (!mags.length) return 0;
+  mags.sort((p, q) => q - p);
+  const top = mags.slice(0, Math.max(2, Math.round(mags.length * 0.06)));
+  return top.reduce((s, v) => s + v, 0) / top.length;
+}
+// The speed of the action from frames (captureFrames) of a video w×h → motion per second, or null (a cut, too few).
+// A short break every few frames – the show keeps running smoothly meanwhile
+async function actionSpeed(fr, w, h) {
+  const gw = grayW(w, h);
+  const pts = [];
+  for (let i = 1; i < fr.length; i++) {
+    const dt = fr[i].t - fr[i - 1].t;
+    if (dt <= 0) continue;
+    if (isCut(fr[i - 1].a, fr[i].a)) return null;
+    if (pts.length % 8 === 7) await new Promise((r) => setTimeout(r));
+    pts.push({ t: fr[i].t, m: actionMotion(fr[i - 1].a.gray, fr[i].a.gray, gw) / dt }); // (px of 64 per second)
+  }
+  return meanSpeed(pts);
+}
+
+// Pinned moments: spots of a video you chose by hand (Change the moment, key M) – a clip of that scene often starts at one of them
+// (kept per file path – the ids of the library are new in every visit)
+const pinsOf = (id) => ((store.get("pmvPins", {}) || {})[id] || []).filter((x) => typeof x === "number");
+function setPins(id, list) {
+  const all = store.get("pmvPins", {}) || {};
+  const l = [...new Set(list.map((x) => Math.round(x * 10) / 10))].sort((a, b) => a - b).slice(-12);
+  if (l.length) all[id] = l;
+  else delete all[id];
+  store.set("pmvPins", all);
+}
+const fmtAt = (x) => `${Math.floor(x / 60)}:${(x % 60).toFixed(1).padStart(4, "0")}`;
+
+// Speed maps of scenes: id → [{ t, len, speed, m }] – spots of the scene and how fast it moves there (from its
+// preview, or m: measured while a clip was prepared – more exact, and scenes without a preview get a map that way).
+// Whether a scene's preview has been looked through: id → true, false (none) or a Promise while it runs
+const speedMaps = new Map();
+const scanned = new Map();
+function setMap(id, map) {
+  speedMaps.delete(id); // (the newest last: when there are too many, the oldest go)
+  speedMaps.set(id, map);
+  if (speedMaps.size > 5000) {
+    const old = speedMaps.keys().next().value;
+    speedMaps.delete(old);
+    scanned.delete(old);
+  }
+}
+// A spot measured while preparing → into the scene's map; what was known about that spot gives way to it
+// (at most 24 measured spots per scene – the oldest go)
+function addSpot(s, t, len, speed) {
+  if (speed == null || s.rg || s.kind !== "video") return;
+  const map = (speedMaps.get(s.id) || []).filter((p) => Math.abs(p.t - t) >= 1);
+  map.push({ t, len, speed, m: true });
+  for (let n = map.filter((p) => p.m).length; n > 24; n--) map.splice(map.findIndex((p) => p.m), 1);
+  setMap(s.id, map);
+}
+// The speeds seen so far (maps and measured clips): "fast" and "calm" are relative to your library
+const speedSeen = [];
+let seenSorted = null;
+function noteSpeed(v) {
+  if (v == null || !(v >= 0)) return; // (null >= 0 is true)
+  speedSeen.push(v);
+  if (speedSeen.length > 600) speedSeen.shift();
+  seenSorted = null;
+}
+// Where a speed stands among those seen (0 = calmest, 1 = fastest); null while too few are known
+function speedPct(v) {
+  if (v == null || speedSeen.length < 8) return null;
+  const S = (seenSorted = seenSorted || Float64Array.from(speedSeen).sort());
+  const at = (f) => {
+    let lo = 0;
+    let hi = S.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (f(S[mid])) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const below = at((x) => x < v);
+  return (below + (at((x) => x <= v) - below) / 2) / S.length;
+}
+
+
 // ==========================================================================
 // Generator: prepare clips, cut to the beat, draw, record
 // ==========================================================================
@@ -1525,6 +1914,8 @@ class Generator {
     this.song = tpl ? tpl.song : song;
     this.music = tpl ? null : music || null;
     this.S = S;
+    skipS[0] = Math.max(0, Number(S.skipHead) || 0);
+    skipS[1] = Math.max(0, Number(S.skipTail) || 0);
     this.setBars();
     this.onClose = onClose;
     this.tpl = tpl || null;
@@ -1540,8 +1931,11 @@ class Generator {
     this.srcIdx = 0;
     this.ready = [];
     this.preparing = 0;
+    this.prepKeys = []; // keys of the clips being prepared
     this.bad = 0;
     this.recent = []; // recently shown clips (variety)
+    this.spots = new Map(); // video → start times used (the next clip of that video comes from elsewhere)
+    this.measuring = 0; // clips whose motion is being measured (clip speed follows the music, motion on the beat)
     this.used = new Set();
     this.shown = new Set(); // all shown clips (credits)
     this.layouts = Object.keys(LAYOUTS).filter((k) => S.layouts[k]);
@@ -1562,7 +1956,8 @@ class Generator {
     this.bi = 0;
     this.lastCut = -99;
     this.cuts = 0;
-    this.events = []; // half beats: stutter, strobe
+    this.events = []; // half beats: stutter, strobe, pictures
+    this.pics = S.picFlash || S.picOverlay ? { ready: [], spent: [], seed: Math.floor(Math.random() * 1e8), order: null, at: 0, busy: false, dead: false, flashUntil: -1, overUntil: -1 } : null;
     this.st = { beatT: -9, beatAmt: 0, energy: 0 };
     this.paused = false;
     this.done = false;
@@ -1574,6 +1969,11 @@ class Generator {
     this.comp.credits = () => `${this.shown.size - this.songShown0} Clips · ${Math.round(this.song.bpm)} BPM`;
     this.start().catch((e) => this.fail(e));
   }
+  // Following Plex: no song of our own (no song volume, no pausing, no skipping)
+  get outside() {
+    return !!(this.music && this.music.type === "follow");
+  }
+
   mount() {
     const el = document.createElement("div");
     el.className = "kb-overlay-host";
@@ -1601,6 +2001,7 @@ class Generator {
           }
           <button class="kb-btn is-icon is-ghost" data-act="reshuffle" title="New clips – the music keeps playing (R)">${icon("shuffle")}</button>
           <button class="kb-btn is-icon is-ghost" data-act="info" title="Which clips are on screen (I)">${icon("info")}</button>
+          <button class="kb-btn is-icon is-ghost" data-act="moments" title="Change the moment a clip is taken from (M)">${icon("edit")}</button>
           <button class="kb-btn is-icon is-ghost" data-act="hidebar" title="Hide this bar (H) – H brings it back">${icon("close")}</button>
           <button class="kb-btn is-icon is-ghost" data-act="full" title="Fullscreen (F)">${icon("expand")}</button>
           <button class="kb-btn is-icon is-ghost" data-act="stop" title="Stop (Esc)">${icon("stop")}</button>
@@ -1639,6 +2040,7 @@ class Generator {
       if (a === "reshuffle") this.reshuffle();
       if (a === "full") this.fullscreen();
       if (a === "info") this.toggleInfo();
+      if (a === "moments") this.openMoments();
       if (a === "hidebar") this.toggleBar();
       if (a === "stop") this.done ? this.close() : this.finish(true);
     });
@@ -1652,11 +2054,49 @@ class Generator {
       else if (e.key === "f" || e.key === "F") this.fullscreen();
       else if ((e.key === "r" || e.key === "R") && !e.repeat && !e.ctrlKey && !e.metaKey && !this.done) this.reshuffle();
       else if (e.key === "i" || e.key === "I") this.toggleInfo();
+      else if ((e.key === "m" || e.key === "M") && !e.ctrlKey && !e.metaKey && !this.done) this.openMoments();
       else if (e.key === "h" || e.key === "H") this.toggleBar();
       else return;
       e.preventDefault();
     };
     document.addEventListener("keydown", this.onKey);
+    // The mouse alone (second monitor): clicks in the middle / on the sides, middle button, wheel – each one is a switch in Output
+    const onBar = (e) => e.target.closest(".kb-pmvg-hud, .kb-pmvg-end, .kb-pmvg-info, .kb-pmvg-moments, button, input, a");
+    el.addEventListener("click", (e) => {
+      if (this.done || onBar(e)) return;
+      const r = this.stage.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width;
+      if (x > 1 / 3 && x < 2 / 3) {
+        if (this.S.mMid && !this.outside) this.togglePause();
+      } else {
+        const mode = this.S.mSidesMode || (this.S.mSides ? "volume" : "off");
+        if (mode === "off" || this.outside) return;
+        const fwd = x >= 2 / 3 !== !!this.S.mSidesRev; // the right third = next / louder (turned round: the left)
+        if (mode === "volume") this.nudgeVolume(fwd ? 5 : -5);
+        else if (this.music && this.music.type === "list") this.skip(fwd ? 1 : -1);
+      }
+    });
+    el.addEventListener("mousedown", (e) => e.button === 1 && this.S.mShuffle && e.preventDefault()); // (no auto-scroll cursor)
+    el.addEventListener("auxclick", (e) => {
+      if (e.button !== 1 || !this.S.mShuffle || this.done || onBar(e)) return;
+      e.preventDefault();
+      this.reshuffle();
+    });
+    el.addEventListener(
+      "wheel",
+      (e) => {
+        const mode = this.S.mWheel;
+        if (!mode || mode === "off" || this.done || onBar(e)) return;
+        e.preventDefault();
+        const dir = (e.deltaY > 0 ? 1 : -1) * (this.S.mWheelRev ? -1 : 1); // 1 = wheel "down"
+        if (mode === "volume") return this.nudgeVolume(-dir * 5);
+        const now = performance.now();
+        if (now - (this.wheelAt || 0) < 700) return; // one notch = one song
+        this.wheelAt = now;
+        if (this.music && this.music.type === "list") this.skip(dir);
+      },
+      { passive: false },
+    );
     let resizeT = 0;
     this.onResize = () => {
       clearTimeout(resizeT);
@@ -1695,6 +2135,88 @@ class Generator {
     if (off) toast("Bar hidden – H shows it again", "ok");
   }
 
+  // Change the moment: where in its video a clip starts, by hand (the show pauses while the panel is open). A moment you
+  // like can be pinned – clips of that video then often start there.
+  openMoments() {
+    if (this.done) return;
+    if (this.momentsEl) return this.closeMoments();
+    const clips = this.videos().filter((m) => m.id != null && m.el && m.el.duration > 0);
+    if (!clips.length) return toast("No video clip on screen yet", "warn");
+    this.momentsPaused = !this.paused && !this.outside;
+    if (this.momentsPaused) this.togglePause();
+    const box = document.createElement("div");
+    box.className = "kb-pmvg-moments";
+    this.stage.appendChild(box); // (in the stage: that fills the screen, also in fullscreen)
+    this.momentsEl = box;
+    const steps = [-10, -1, -0.1, 0.1, 1, 10];
+    const paint = () => {
+      box.innerHTML =
+        `<div class="kb-pmvg-mhead"><b>Change the moments</b><button class="kb-btn is-icon is-ghost" data-mclose aria-label="Close">${icon("close")}</button></div>` +
+        `<p class="kb-hint">Move the slider (or use the buttons) to take a clip from another moment of its video. Pin a moment you like: clips of that video then often start there.</p>` +
+        clips
+          .map((m, i) => {
+            const dur = m.el.duration;
+            const pins = pinsOf(pinKey(m));
+            const pinned = pins.some((x) => Math.abs(x - m.start) < 0.25);
+            return `<div class="kb-pmvg-mrow" data-i="${i}">
+              <div class="kb-pmvg-mname"><b>${i + 1}</b> ${esc(m.name || m.key)} <small>${fmtAt(m.start)} / ${fmtAt(dur)}</small></div>
+              <input type="range" min="0" max="${Math.max(1, dur - 1).toFixed(1)}" step="0.1" value="${m.start.toFixed(1)}" data-slide aria-label="Moment">
+              <div class="kb-pmvg-mbtn">${steps.map((d) => `<button type="button" class="kb-btn is-ghost" data-step="${d}">${d > 0 ? "+" : "−"}${Math.abs(d)} s</button>`).join("")}
+                <button type="button" class="kb-btn${pinned ? " is-primary" : ""}" data-pin>${pinned ? "Pinned ✓" : "Pin this moment"}</button>
+                ${m.origStart != null && Math.abs(m.origStart - m.start) > 0.05 ? `<button type="button" class="kb-btn is-ghost" data-orig>Back to the picked moment</button>` : ""}</div>
+              ${pins.length ? `<div class="kb-pmvg-pins"><small>Pinned:</small> ${pins.map((x) => `<span class="kb-chip"><button type="button" data-go="${x}">${fmtAt(x)}</button><button type="button" data-unpin="${x}" aria-label="Remove">×</button></span>`).join("")}</div>` : ""}
+            </div>`;
+          })
+          .join("");
+    };
+    const set = (m, x, keepFocus) => {
+      const dur = m.el.duration;
+      const t = Math.max(0, Math.min(dur - 1, Math.round(x * 10) / 10));
+      if (m.origStart == null) m.origStart = m.start;
+      m.start = t;
+      if (!m.endAt || t >= m.endAt - 0.5) m.endAt = dur - 0.4;
+      m.el.currentTime = t;
+      if (!keepFocus) paint();
+      else {
+        const row = box.querySelector(`[data-i="${clips.indexOf(m)}"] .kb-pmvg-mname small`);
+        if (row) row.textContent = `${fmtAt(t)} / ${fmtAt(dur)}`;
+      }
+    };
+    box.addEventListener("input", (e) => {
+      const r = e.target.closest("[data-slide]");
+      if (r) set(clips[Number(r.closest("[data-i]").dataset.i)], Number(r.value), true);
+    });
+    box.addEventListener("change", (e) => e.target.closest("[data-slide]") && paint());
+    box.addEventListener("click", (e) => {
+      if (e.target.closest("[data-mclose]")) return this.closeMoments();
+      const row = e.target.closest("[data-i]");
+      if (!row) return;
+      const m = clips[Number(row.dataset.i)];
+      const b = e.target.closest("button");
+      if (!b) return;
+      if (b.dataset.step != null) set(m, m.start + Number(b.dataset.step));
+      else if (b.dataset.go != null) set(m, Number(b.dataset.go));
+      else if (b.dataset.orig != null) set(m, m.origStart);
+      else if (b.dataset.unpin != null) {
+        setPins(pinKey(m), pinsOf(pinKey(m)).filter((x) => x !== Number(b.dataset.unpin)));
+        paint();
+      } else if (b.dataset.pin != null) {
+        const pins = pinsOf(pinKey(m));
+        const near = pins.find((x) => Math.abs(x - m.start) < 0.25);
+        setPins(pinKey(m), near != null ? pins.filter((x) => x !== near) : [...pins, m.start]);
+        paint();
+      }
+    });
+    paint();
+  }
+  closeMoments() {
+    if (!this.momentsEl) return;
+    this.momentsEl.remove();
+    this.momentsEl = null;
+    if (this.momentsPaused && this.paused && !this.done) this.togglePause();
+    this.momentsPaused = false;
+  }
+
   // Clip info: what's on screen (name, file, size, state) and what had to be skipped, and why
   toggleInfo(on) {
     const box = this.h("info");
@@ -1720,14 +2242,21 @@ class Generator {
     const row = (m, i) => {
       const [st, bad] = state(m);
       const name = m.name || m.key;
-      return `<div><b>${i + 1}</b> ${esc(name)}${m.file && m.file !== name ? ` <small>${esc(m.file)}</small>` : ""} <small>${m.w}×${m.h}</small> <span class="${bad ? "is-bad" : ""}">${esc(st)}</span></div>`;
+      // clip speed follows the music: how fast the clip is among those seen
+      const pct = this.S.paceMatch ? speedPct(m.speed) : null;
+      const speed = pct != null ? ` <small>speed ${Math.round(pct * 100)} %</small>` : "";
+      return `<div><b>${i + 1}</b> ${esc(name)}${m.file && m.file !== name ? ` <small>${esc(m.file)}</small>` : ""} <small>${m.w}×${m.h}</small>${m.tempo && this.S.beatSync ? ` <small>on the beat ×${m.tempo.toFixed(2)}</small>` : ""}${speed} <span class="${bad ? "is-bad" : ""}">${esc(st)}</span></div>`;
     };
     const fails = (this.failed || []).slice(-5).reverse();
+    // (clip speed follows the music: how fast the music feels now, to hold against the clips' speed)
+    const pace = this.S.paceMatch && this.song ? `<div><small>Music pace ${Math.round(this.paceAt(this.now()) * 100)} % · ${speedMaps.size} videos with a speed map</small></div>` : "";
     box.innerHTML =
+      pace +
       [...new Set(this.groups)].filter(Boolean).map(row).join("") +
       (fails.length ? `<div class="kb-pmvg-infohead">Skipped</div>` + fails.map((f) => `<div class="is-bad">${esc(f.name)} <small>${esc(f.file || "")}</small> – ${esc(f.why)}${f.n > 1 ? ` <small>×${f.n}</small>` : ""}</div>`).join("") : "");
   }
-  // A clip that failed: listed once (with a count) and not tried again in this show
+  // A clip that failed: listed once (with a count) and not tried again in this show –
+  // only slow to load (timed out): it gets two more chances (with few clips every one counts)
   noteFail(s, e) {
     const why = e.why || e.message || String(e);
     this.failed = this.failed || [];
@@ -1738,7 +2267,7 @@ class Generator {
       this.failed.push(this.failed.splice(this.failed.indexOf(known), 1)[0]);
     } else this.failed.push({ key: s.key, name: s.name || s.key, file: s.file, why, n: 1 });
     if (this.failed.length > 20) this.failed.shift();
-    (this.badKeys = this.badKeys || new Set()).add(s.key);
+    if (e.message !== "Timed out" || (known && known.n >= 3)) (this.badKeys = this.badKeys || new Set()).add(s.key);
     if (!known) console.warn(`[PMV Generator] clip skipped: ${s.name || s.key} – ${why}`);
   }
 
@@ -1763,6 +2292,13 @@ class Generator {
     saved.voiceMode = this.S.voiceMode;
     saved.fx = Object.assign({}, saved.fx, { voice: !!this.S.fx.voice });
     store.set("pmvgen", saved);
+  }
+
+  nudgeVolume(d) {
+    if (this.outside) return;
+    const v = Math.max(0, Math.min(100, Math.round(((this.S.songVol ?? 100) + d) / 5) * 5));
+    this.setVolume("songVol", v);
+    toast(`Song volume ${v} %`, "ok");
   }
 
   setVolume(key, v) {
@@ -1827,20 +2363,37 @@ class Generator {
     this.srcIdx = 0;
   }
 
-  async nextSource(st = 0, want = null) {
+  async nextSource(st = 0, want = null, goal = null) {
     // Several clips are prepared in parallel – fetch new ones only once
     for (let tries = 0; ; tries++) {
       while (this.srcIdx >= this.sources.length) {
         this.fetching = this.fetching || this.fetchSources().finally(() => (this.fetching = null));
         await this.fetching;
       }
+      if (goal != null && !want && !tries) {
+        const again = this.bySpeed(goal); // (clip speed follows the music)
+        if (again) return again;
+      }
       // A shape is short (per-layout clip shape): take a source of that shape that is already known
       if (want) {
-        const fits = (x) => (x.w || (x.item && x.item.w)) && (x.h || (x.item && x.item.h)) && !(this.badKeys && this.badKeys.has(x.key)) && (want === "portrait" ? (x.h || x.item.h) > (x.w || x.item.w) : (x.w || x.item.w) >= (x.h || x.item.h));
+        const wh = (x) => [x.w || (x.item && x.item.w) || 0, x.h || (x.item && x.item.h) || 0];
+        const fits = (x) => {
+          const [w, h] = wh(x);
+          return w && h && !(this.badKeys && this.badKeys.has(x.key)) && (want === "portrait" ? h > w : w >= h);
+        };
         // (new ones first, then not shown recently; with a small selection a repeat is better than the wrong shape)
         let k = this.sources.findIndex((x, n) => n >= this.srcIdx && fits(x) && !this.isRecent(x));
         if (k < 0) k = this.sources.findIndex((x) => fits(x) && !this.isRecent(x));
-        if (k < 0) k = this.sources.findIndex(fits);
+        if (k < 0) {
+          // All of that shape are recent: in turns – the one with the fewest copies ready, then the one shown longest ago
+          // (always the first that fits = always the same clip, with few clips of that shape)
+          const keys = this.recent.map((m) => m.key);
+          let low = Infinity;
+          this.sources.forEach((x, n) => {
+            const sc = fits(x) ? this.copies(x.key) * 100 + keys.lastIndexOf(x.key) : Infinity;
+            if (sc < low) [low, k] = [sc, n];
+          });
+        }
         if (k >= 0) return this.sources[k];
       }
       const s = this.sources[this.srcIdx++];
@@ -1852,7 +2405,65 @@ class Generator {
 
   // Variety: the same clip not within the last 24
   isRecent(s) {
-    return this.used.has(s.key) || this.ready.some((m) => m.key === s.key);
+    return this.used.has(s.key) || this.copies(s.key) > 0;
+  }
+  // How often a clip is ready or being prepared
+  copies(key) {
+    return this.ready.filter((m) => m.key === key).length + this.prepKeys.filter((k) => k === key).length;
+  }
+  // Clip speed follows the music: the clip whose video has a spot with a speed that fits the music best (goal 0–1) –
+  // the video is picked for its speed, not only the spot in it. Of the next 24 in line; the others stay in line, and
+  // one without a map yet (or an image) counts as so-so, so one known not to fit comes after it.
+  // If none of them fits well, the scenes of this round used before count too (not lately, and less with every
+  // time they were used): a fast scene has more than one fast spot, and on a long loud part the fast ones in line
+  // soon run out. → such a scene to take again, or null (then the next in line is the one – moved up)
+  bySpeed(goal) {
+    const bad = (x) => this.badKeys && this.badKeys.has(x.key);
+    const end = Math.min(this.sources.length, this.srcIdx + 24);
+    let best = this.srcIdx;
+    let low = Infinity;
+    for (let n = this.srcIdx; n < end; n++) {
+      const x = this.sources[n];
+      if (bad(x) || (this.S.variety && this.isRecent(x))) continue;
+      const d = (this.mapFit(x, goal) ?? 0.3) + Math.random() * 0.05;
+      if (d < low) [low, best] = [d, n];
+    }
+    if (low > 0.12) {
+      for (let n = 0; n < this.srcIdx; n++) {
+        const x = this.sources[n];
+        const f = bad(x) || this.isRecent(x) ? null : this.mapFit(x, goal);
+        if (f == null) continue;
+        const d = f + 0.25 * (this.spots.get(x.id) || []).length + Math.random() * 0.05;
+        if (d < low) [low, best] = [d, n];
+      }
+    }
+    if (best < this.srcIdx) return this.sources[best];
+    if (best > this.srcIdx) this.sources.splice(this.srcIdx, 0, this.sources.splice(best, 1)[0]);
+    return null;
+  }
+  // How near a scene's best spot comes to a speed (0–1, among those seen; spots shown lately count less)
+  // → null without a map
+  mapFit(x, goal) {
+    const map = x.kind === "video" ? speedMaps.get(x.id) : null;
+    if (!Array.isArray(map)) return null;
+    const seq = this.seqWindow(x.dur);
+    let d = null;
+    for (const p of map) {
+      const pct = speedPct(p.speed);
+      if (pct == null || p.t < introEnd(x.dur) || p.t >= x.dur - 3 - tailX(x.dur) || (seq && (p.t < seq.lo || p.t > seq.hi))) continue;
+      const v = Math.abs(pct - goal) + (this.usedNear(x, p.t, x.dur) ? 0.5 : 0);
+      if (d == null || v < d) d = v;
+    }
+    return d;
+  }
+  // Follow the scenes' timeline: how far the song is = where in a scene (dur s) the clip is taken from (± a window)
+  // → { lo, hi } or null
+  seqWindow(dur) {
+    if (!this.S.sequenced || !(dur > 10) || !this.song || !(this.song.duration > 0)) return null;
+    const prog = Math.min(1, Math.max(0, this.now() / this.song.duration));
+    const half = Math.max(6, dur * 0.12);
+    const lo = Math.max(0, Math.min(prog * dur - half, dur - 6));
+    return { lo, hi: Math.min(dur - 3, Math.max(lo, prog * dur + half)) };
   }
   remember(m) {
     this.shown.add(m.key);
@@ -1860,18 +2471,56 @@ class Generator {
     if (this.recent.length > 24) this.recent.shift();
     this.used = new Set(this.recent.map((x) => x.key));
   }
+  // A spot near one of the video's last starts (within 3 % of the scene, at least 6 s)
+  usedNear(s, t, dur) {
+    const r = Math.max(6, dur * 0.03);
+    return (this.spots.get(s.id) || []).some((u) => Math.abs(u - t) < r);
+  }
+  useSpot(s, t) {
+    const l = this.spots.get(s.id) || [];
+    l.push(t);
+    if (l.length > 8) l.shift();
+    this.spots.set(s.id, l);
+  }
   varietyPenalty(m) {
     if (!this.S.variety) return 0;
     return this.used.has(m.key) ? 3 : 0;
   }
 
+  // How fast the music feels at song time t (0–1): how busy it is and how loud; without that (live) the loudness
+  paceAt(t) {
+    const B = this.song && this.song.beats;
+    if (!B || !B.length) return 0.5;
+    let lo = 0;
+    let hi = B.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (B[mid] <= t) lo = mid;
+      else hi = mid - 1;
+    }
+    const e = (this.song.energy && this.song.energy[lo]) || 0;
+    return this.song.pace ? 0.6 * (this.song.pace[lo] || 0) + 0.4 * e : e;
+  }
+
+  // About how long a clip prepared now waits until it comes on (seconds): the clips ready before it, each for
+  // the time between cuts lately – at half the tempo twice as long (the clip has to fit the music *then*)
+  readyWait() {
+    const cuts = this.log.filter((e) => e.type === "cut").slice(-9);
+    const gap = cuts.length >= 3 ? (cuts[cuts.length - 1].t - cuts[0].t) / (cuts.length - 1) : this.song && this.song.bpm ? 120 / this.song.bpm : 1;
+    // (several fields share the cuts: a field's clip is taken at every n-th cut, but any ready clip can go into any field)
+    return Math.min(20, Math.max(1.5, 0.5 + (this.ready.length + 1) * Math.max(0.2, gap)));
+  }
+
+
   fillPool() {
     // Enough supply for a layout change with four new fields
     // (match cuts need a bit more choice)
+    // (clip speed follows the music: two more, so calm and fast ones are both at hand when the music turns)
+    const cap = (this.S.matchCut ? 8 : 6) + (this.S.paceMatch ? 2 : 0);
+    this.dropStale(cap);
     // At most 3 at once: each one decodes and seeks its video – with 4K several at once choke the decoder
     while (!this.done && this.preparing < 3) {
       const want = this.shapeShort();
-      const cap = this.S.matchCut ? 8 : 6;
       const have = this.ready.length + this.preparing;
       if (have >= cap && !(want && have < (this.S.matchCut ? 14 : 12))) break;
       this.preparing++;
@@ -1879,6 +2528,7 @@ class Generator {
       this.prepareOne(want)
         .then((m) => {
           if (this.done) return this.release(m);
+          m.readyAt = performance.now();
           this.ready.push(m);
           this.bad = 0;
         })
@@ -1891,27 +2541,65 @@ class Generator {
     }
   }
 
+  // Clip speed follows the music: a full supply of clips that fit neither the music now nor what comes soon (and have
+  // been waiting a while) makes room – the one waiting longest goes, one at a time, so the music gets new clips that
+  // fit, not only the few left. Two stay for when the music turns
+  dropStale(cap) {
+    if (!this.S.paceMatch || !this.song || !this.song.beats || !this.song.beats.length) return;
+    if (this.ready.length + this.preparing < cap) return;
+    const t = this.now();
+    const [a, b] = [this.paceAt(t), this.paceAt(t + this.readyWait())];
+    const since = performance.now() - 8000;
+    const stale = this.ready.filter((m) => {
+      const p = speedPct(m.speed);
+      return p != null && Math.abs(p - a) > 0.4 && Math.abs(p - b) > 0.4 && m.readyAt < since;
+    });
+    if (stale.length < 3) return;
+    const m = stale.reduce((x, y) => (y.readyAt < x.readyAt ? y : x));
+    this.ready.splice(this.ready.indexOf(m), 1);
+    this.release(m);
+  }
+
   // Per-layout clip shape: which shape (landscape / portrait) the ready clips are short of (null = none)
   shapeShort() {
     const rules = this.S.layoutShape || {};
     const need = [...new Set(this.layouts.map((k) => rules[k]).filter((v) => v === "landscape" || v === "portrait"))];
     if (!need.length) return null;
-    const have = (sh) => this.ready.filter((m) => (sh === "portrait" ? m.h > m.w : m.w >= m.h)).length + this.prepShape[sh];
-    need.sort((a, b) => have(a) - have(b));
-    return have(need[0]) < 5 ? need[0] : null;
+    const dims = (x) => [x.w || (x.item && x.item.w) || 0, x.h || (x.item && x.item.h) || 0];
+    const isShape = (x, sh) => {
+      const [w, h] = dims(x);
+      return w && h && (sh === "portrait" ? h > w : w >= h);
+    };
+    const have = (sh) => this.ready.filter((m) => isShape(m, sh)).length + this.prepShape[sh];
+    // Enough for the biggest layout with that rule – more only while there are other clips of that shape
+    // (with few of them: no pile of copies of one clip that crowds out the rest)
+    const target = (sh) => {
+      const avail = new Set(this.sources.filter((x) => isShape(x, sh) && !(this.badKeys && this.badKeys.has(x.key))).map((x) => x.key)).size;
+      const groups = Math.max(...this.layouts.filter((k) => rules[k] === sh).map((k) => LAYOUTS[k].groups));
+      return Math.min(5, Math.max(groups, avail));
+    };
+    const short = need.map((sh) => [sh, have(sh) - target(sh)]).filter(([, d]) => d < 0).sort((a, b) => a[1] - b[1]);
+    return short.length ? short[0][0] : null;
   }
 
   async prepareOne(want = null) {
-    const s = await this.nextSource(0, want);
+    // Clip speed follows the music: how fast the music will feel when this clip comes on – some time within the
+    // stretch the ready clips cover (they are picked by speed, not in turn, so the ready ones should cover what is
+    // coming: now as well as a drop in a few seconds). The video and the spot in it are picked for that
+    const goal = this.S.paceMatch ? this.paceAt(this.now() + 1 + Math.random() * this.readyWait()) : null;
+    const s = await this.nextSource(0, want, goal);
+    this.prepKeys.push(s.key); // (variety: not the same clip again while it is being prepared)
     try {
-      return await this.prepareFrom(s);
+      return await this.prepareFrom(s, goal);
     } catch (e) {
       if (!e.skip) this.noteFail(s, e);
       throw e;
+    } finally {
+      this.prepKeys.splice(this.prepKeys.indexOf(s.key), 1);
     }
   }
 
-  async prepareFrom(s) {
+  async prepareFrom(s, goal = null) {
     if (s.kind === "image") {
       const img = new Image();
       img.decoding = "async";
@@ -1935,42 +2623,68 @@ class Generator {
     v.loop = true;
     this.pool.appendChild(v);
     try {
-      v.src = s.url;
+      // The same file a second time at once (few clips: on screen, ready and being prepared): an address of its own –
+      // the browser lets two loads of one address wait for each other, the clip on screen stalls and nothing new comes
+      const twin = [...this.pool.children].some((x) => x !== v && x.dataset.key === s.key);
+      v.dataset.key = s.key;
+      v.src = twin ? copyUrl(s.url, (this.copyN = (this.copyN || 0) + 1)) : s.url;
       await withTimeout(once(v, "loadedmetadata"), 8000);
       // Opens but no picture (e.g. a codec the browser can't decode): skip it – else it's a black field
       if (!v.videoWidth || !v.videoHeight) throw Object.assign(new Error("no picture"), { why: "no picture – the browser can't decode this video (codec?)", unplayable: true });
       const dur = isFinite(v.duration) && v.duration > 0 ? v.duration : s.dur;
       measured(s.item, v.videoWidth, v.videoHeight, dur, this.S);
-      // Follow the scenes' timeline: how far the song is = where in the scene the clip is taken from (± a window)
-      let seq = null;
-      if (this.S.sequenced && dur > 10 && this.song && this.song.duration > 0) {
-        const prog = Math.min(1, Math.max(0, this.now() / this.song.duration));
-        const half = Math.max(6, dur * 0.12);
-        const lo = Math.max(0, Math.min(prog * dur - half, dur - 6));
-        const hi = Math.min(dur - 3, Math.max(lo, prog * dur + half));
-        seq = { lo, hi };
-      }
+      const seq = this.seqWindow(dur);
       const inSeq = (t) => !seq || (t >= seq.lo && t <= seq.hi);
-      const rand = () => (seq ? seq.lo + Math.random() * Math.max(0, seq.hi - seq.lo) : dur > 10 ? dur * 0.08 + Math.random() * Math.max(0, dur * 0.84 - 4) : 0);
+      // (the scene timeline starts at the video's start – but not in its intro)
+      const head = introEnd(dur);
+      const rand = () => (seq ? Math.max(seq.lo, Math.min(head, seq.hi)) + Math.random() * Math.max(0, seq.hi - Math.max(seq.lo, head)) : dur > 10 ? head + Math.random() * Math.max(0, Math.min(dur * 0.92 - 4, dur - 4 - tailX(dur)) - head) : 0);
       const seek = async (t) => {
         v.currentTime = t;
         await withTimeout(once(v, "seeked"), 8000);
         if (v.readyState < 2) await withTimeout(once(v, "loadeddata"), 8000);
       };
-      let start = rand();
+      // A spot this video hasn't been shown from lately (a few tries, then whatever comes)
+      const fresh = (t) => !this.usedNear(s, t, dur);
+      const freshRand = () => {
+        let t = rand();
+        for (let i = 0; i < 4 && !fresh(t); i++) t = rand();
+        return t;
+      };
+      let start = freshRand();
       let info = null;
-      if (this.S.bestSpots && dur > 10) {
+      let mo = null; // motion at the start (measured below), for clips that follow the music – see takeMedia
+      // Clip speed follows the music: the spot of the video's speed map that fits how fast the music will feel
+      // when this clip comes on (goal, see prepareOne)
+      let spd = null;
+      const map = goal != null ? speedMaps.get(s.id) : null;
+      let mapCands = null;
+      if (Array.isArray(map)) {
+        mapCands = map
+          .filter((x) => x.t >= head && x.t < dur - 3 - tailX(dur) && inSeq(x.t))
+          .map((x) => ({ x, d: Math.abs((speedPct(x.speed) ?? 0.5) - goal) + (fresh(x.t) ? 0 : 0.5) + Math.random() * 0.12 }))
+          .sort((a, b) => a.d - b.d);
+      }
+      const mapPick = mapCands && mapCands[0];
+      // Pinned moments (Change the moment, key M): most of the time a clip of this video starts at one of them
+      const pins = pinsOf(pinKey(s)).filter((x) => x > 0 && x < dur - 1.5);
+      const pinned = pins.length > 0 && Math.random() < 0.6;
+      if (pinned) {
+        start = pins[Math.floor(Math.random() * pins.length)];
+      } else if (mapPick) {
+        start = mapPick.x.t;
+        spd = mapPick.x.speed;
+      } else if (this.S.bestSpots && dur > 10) {
         // Look at several random spots; two frames each for motion. Big videos (above 1440p) and a
         // low supply look at fewer – every seek costs, and 4K seeks are slow.
         const big = v.videoWidth * v.videoHeight > 2560 * 1440;
         const urgent = this.ready.length < 2 || big;
         const n = urgent ? 2 : 4;
-        const cands = Array.from({ length: n }, () => ({ t: rand(), bonus: 0 }));
+        const cands = Array.from({ length: n }, () => ({ t: freshRand(), bonus: 0 }));
         // Clean cuts: a clip plays for a few beats from its start – a scene change in that stretch would
         // jump to another scene by itself. Spots with one are passed over (up to a few more are tried).
         const clean = !!this.S.cleanCuts && !urgent;
         const span = clean ? Math.max(1.5, Math.min(4, this.song && this.song.bpm ? (4 * 60) / this.song.bpm : 2.5)) : 0;
-        if (clean) for (let i = 0; i < 4; i++) cands.push({ t: rand(), bonus: 0, extra: true });
+        if (clean) for (let i = 0; i < 4; i++) cands.push({ t: freshRand(), bonus: 0, extra: true });
         let best = -Infinity;
         let anyClean = false;
         for (const c of cands) {
@@ -2001,11 +2715,69 @@ class Generator {
             best = sc;
             start = t0;
             info = a;
+            mo = cut ? 0 : motion(a, b);
           }
         }
       }
+      this.useSpot(s, start);
       await seek(start);
-      const m = { kind: "video", el: v, w: v.videoWidth, h: v.videoHeight, id: s.id, key: s.key, start, name: s.name, file: s.file };
+      // Measure the motion here (the clip plays 1.8 s of video at double speed in the pool – about 0.9 s, so the
+      // supply keeps up with fast cuts): its speed (clip speed follows the music – more exact than the map) and
+      // its rhythm (motion on the beat: if it fits the song's tempo, the clip starts on a turn of the motion –
+      // it comes on screen on a beat – and plays a little faster or slower).
+      // Not with big videos (above 1440p: decoding them along costs too much)
+      let tempo = null;
+      let pulse = null; // spacing of the motion's turns (video seconds) and one turn – onBeat keeps them on the beat
+      let turnAt = null;
+      const SECS = 1.8;
+      const sync = this.S.beatSync && this.song && this.song.bpm > 0;
+      if ((sync || this.S.paceMatch) && v.videoWidth * v.videoHeight <= 2560 * 1440 && start + SECS < dur - 1 && this.measuring < 3) {
+        this.measuring++;
+        try {
+          let fr = await captureFrames(v, SECS, 2);
+          let ms = this.S.paceMatch ? await actionSpeed(fr, v.videoWidth, v.videoHeight) : null;
+          // (a spot picked from the map for its speed doesn't count among the speeds seen: they should tell how fast
+          // the library is, not what was picked – else a loud song fills them with fast ones, and fast seems slower)
+          if (!mapPick) noteSpeed(ms);
+          addSpot(s, start, SECS, ms); // (the scene's map learns the spot – next time it is known)
+          // A piece of the map is only 0.75 s of the scene: if the spot turns out far off the wanted pace,
+          // the next best piece is tried, and the better of the two taken
+          const off = (x) => Math.abs((speedPct(x) ?? goal) - goal);
+          if (mapPick && start === mapPick.x.t && mapCands.length > 1 && ms != null && off(ms) > 0.35) {
+            const alt = mapCands[1].x.t;
+            await seek(alt);
+            const fr2 = await captureFrames(v, SECS, 2);
+            const ms2 = await actionSpeed(fr2, v.videoWidth, v.videoHeight);
+            addSpot(s, alt, SECS, ms2);
+            if (ms2 != null && off(ms2) < off(ms)) [start, fr, ms] = [alt, fr2, ms2];
+          }
+          if (ms != null) spd = ms;
+          const pts = motionCurve(fr);
+          const r = sync && pts && rhythmOf(pts);
+          if (r) {
+            let rate = beatFit(r.period, this.song.bpm);
+            if (!rate && r.half) rate = beatFit(r.half, this.song.bpm);
+            // Starts on the first turn from the start on – also when the tempo doesn't fit: with fast cuts a clip
+            // is on for a beat or two, then the motion setting in on the beat is what shows
+            const step = r.half || r.period;
+            const turn = r.turn - Math.floor((r.turn - start) / step) * step;
+            if (!pinned && turn < dur - 1) start = turn;
+            tempo = rate;
+            pulse = step;
+            turnAt = turn;
+          }
+        } catch (e) {
+          /* not measurable – the speed from the map (if any) stays, the clip just isn't synced */
+        } finally {
+          this.measuring--;
+        }
+        await seek(start);
+      }
+      const m = { kind: "video", el: v, w: v.videoWidth, h: v.videoHeight, id: s.id, key: s.key, start, name: s.name, file: s.file,
+        motion: mo, tempo, pulse, turnAt, speed: spd, pinned };
+      // Where the clip turns back to its start (see loop()): just before the video's end – else it would start over
+      // at 0, in its intro (a spot near the end, a clip that stays on for long)
+      if (dur - 0.4 > start + 0.5) m.endAt = dur - 0.4;
       m.sig = info || (await analyzeAsync(v, m.w, m.h));
       if (this.S.smartCrop) {
         m.focus = Object.assign({}, m.sig.focus);
@@ -2051,10 +2823,29 @@ class Generator {
       if (fit.length) cand = fit;
       else if (strict) return null; // (a single field: better keep the clip than show the wrong shape)
     }
-    cand.slice(0, this.S.matchCut ? 8 : 5).forEach((i) => {
+    // Copies of one clip count once – else a few of them fill the choice and the other clips never come up
+    const seen = new Set();
+    cand = cand.filter((i) => !seen.has(this.ready[i].key) && seen.add(this.ready[i].key));
+    // (clip speed follows the music: all of them – the ones just prepared for a change of pace are the newest)
+    if (!this.S.paceMatch) cand = cand.slice(0, this.S.matchCut ? 8 : 5);
+    // Best moments: calm music gets the calmer clips, loud parts and drops the ones where the most is going on.
+    // Ranked among the candidates; unknown (images) = in the middle
+    const rank = new Map();
+    // Clip speed follows the music: how fast the music feels now against where each clip's speed stands
+    // (unknown, e.g. images = in the middle) – takes the place of the softer ranking below
+    const pace = this.S.paceMatch ? this.paceAt(this.now()) : null;
+    if (this.S.bestSpots && pace == null) {
+      const known = cand.map((i) => [i, this.ready[i].motion != null ? Math.min(1, this.ready[i].motion / 0.3) : null]).filter(([, a]) => a != null).sort((x, y) => x[1] - y[1]);
+      if (known.length >= 2) known.forEach(([i], n) => rank.set(i, n / (known.length - 1)));
+    }
+    const energy = this.st.energy || 0;
+    cand.forEach((i) => {
       const m = this.ready[i];
       let s = Math.abs(Math.log(m.w / m.h / aspect));
       if (outSig) s += 1.5 * matchDist(outSig, m.sig);
+      if (pace != null) s += 2.5 * Math.abs((speedPct(m.speed) ?? 0.5) - pace);
+      else if (rank.size) s += 1.2 * Math.abs((rank.has(i) ? rank.get(i) : 0.5) - energy);
+      if (this.S.beatSync && m.tempo) s -= 1; // motion on the beat: clips whose rhythm fits come first
       s += this.varietyPenalty(m);
       if (s < score) {
         score = s;
@@ -2066,7 +2857,10 @@ class Generator {
     m.shownAt = performance.now();
     m.zoomDir = (this.zoomFlip = !this.zoomFlip) ? 1 : -1; // zoom-in entry: alternating strong/soft (always zooming in)
     if (m.kind === "video") {
-      m.el.playbackRate = this.rate || 1;
+      // Motion on the beat: from here onBeat keeps the turns on it – the expectation starts on the turn grid
+      if (m.tempo && m.pulse) m.vExp = m.turnAt + Math.round((m.el.currentTime - m.turnAt) / m.pulse) * m.pulse;
+      m.sync = 1;
+      m.el.playbackRate = (this.rate || 1) * (m.tempo || 1);
       m.el.play().catch(() => {});
       this.watchFrames(m);
     }
@@ -2211,6 +3005,7 @@ class Generator {
 
   async start() {
     this.fillPool();
+    this.topUpPics();
     // Wait until the first clips are ready (max. 20 s)
     const t0 = performance.now();
     while (this.ready.length < 3 && !this.done) {
@@ -2605,6 +3400,13 @@ class Generator {
     // (with "cut ahead of the beat" the cut is made a few ms early; the zoom pulse still sits on the real beat)
     const lead = (this.S.cutLead || 0) / 1000;
     while (this.bi < beats.length && beats[this.bi] - lead <= p) this.onBeat(this.bi++, t);
+    // A clip at its end turns back to its start (see prepareFrom) – also when the video got to its end first and
+    // started over at 0 (its intro)
+    for (const m of this.groups) {
+      if (!m || !m.endAt || m.kind !== "video") continue;
+      const ct = m.el.currentTime;
+      if (ct >= m.endAt || ct < m.start - 0.5) m.el.currentTime = m.start;
+    }
     if (this.tpl) {
       const evs = this.tpl.events;
       while (this.ti < evs.length && evs[this.ti].t <= t) this.applyEvent(evs[this.ti++], t);
@@ -2613,6 +3415,7 @@ class Generator {
       const ev = this.events.shift();
       if (ev.type === "stutter") this.stutter(t);
       if (ev.type === "strobe") this.comp.strobe(t);
+      if (ev.type === "pic") this.picFire(ev, t);
     }
     // Draw when a clip on screen has a new picture (every clip frame shows up, evenly – also on 144/240 Hz
     // screens, where a fixed ~60 per second skipped and bunched clip frames), at most every 4 ms;
@@ -2662,6 +3465,21 @@ class Generator {
     const minB = Math.max(0, Math.round(+S.minBeats || 0));
     const maxB = Math.max(0, Math.round(+S.maxBeats || 0));
     const beats = this.song.beats;
+    // Motion on the beat: hold the turns on it. The measured period is a touch off and play() starts late, so
+    // the phase drifts (~5 ms per beat per 1 % of error). Once per beat the clip's video time is compared with
+    // where the turn grid says it should be, and the playback is trimmed a little for the next beat – no image
+    // work. The error is folded to the nearest turn, so a marker clip's loop jump snaps back in too.
+    const gap = k > 0 ? beats[k] - beats[k - 1] : 60 / this.song.bpm;
+    for (const m of this.videos()) {
+      if (!m.tempo || !m.pulse || m.vExp == null || m.el.paused) continue;
+      m.vExp += gap * (this.rate || 1) * m.tempo;
+      let err = (m.el.currentTime - m.vExp) % m.pulse;
+      if (err > m.pulse / 2) err -= m.pulse;
+      else if (err < -m.pulse / 2) err += m.pulse;
+      m.vExp = m.el.currentTime - err; // whole pulses off (a loop jump) are carried, not fought
+      m.sync = Math.abs(err) < 0.01 ? 1 : Math.max(0.95, Math.min(1.05, 1 - err / (gap * (this.rate || 1) * m.tempo)));
+      m.el.playbackRate = (this.rate || 1) * (m.tempo || 1) * m.sync;
+    }
     const e = this.song.energy[k] || 0;
     const prev = this.song.energy[k - 4] || 0;
     // A drop counts once – otherwise the signal stays up for several beats in a row
@@ -2779,7 +3597,104 @@ class Generator {
       this.events.sort((a, b) => a.t - b.t);
     }
     if (S.fx.strobe && e > 0.85) comp.strobe(t);
+    if (this.pics && !this.revealing) this.picBeat(k, e, bar, len);
   }
+
+  // ---------- Pictures: image flash and image overlay ----------
+
+  // The pictures of the library: the images, in a random order; a few are decoded ahead (shrunk to 1600 px so that they stay light)
+  async topUpPics() {
+    const P = this.pics;
+    if (!P || P.busy || P.dead || this.done) return;
+    P.busy = true;
+    try {
+      if (!P.order || !P.order.length) {
+        const imgs = lib.all().filter((it) => it.kind === "image" && !it.bad);
+        if (!imgs.length) {
+          if (!P.warned) toast("No images in the library for the pictures – add some image files", "error");
+          P.warned = true;
+          return void (P.dead = !(P.ready.length || P.spent.length));
+        }
+        P.order = shuffle(imgs);
+      }
+      const have = new Set([...P.ready, ...P.spent].map((x) => x.id));
+      const list = [];
+      while (P.order.length && list.length < 12) {
+        const it = P.order.pop();
+        if (!have.has(it.id) && !it.bad) list.push(it);
+      }
+      await Promise.all(
+        list.map(async (it) => {
+          try {
+            const bmp0 = await withTimeout(createImageBitmap(it.file), 15000);
+            const k = Math.min(1, 1600 / Math.max(bmp0.width, bmp0.height));
+            let el = bmp0;
+            if (k < 1) {
+              el = await createImageBitmap(bmp0, { resizeWidth: Math.round(bmp0.width * k), resizeHeight: Math.round(bmp0.height * k), resizeQuality: "medium" });
+              bmp0.close();
+            }
+            if (P.dead) return el.close();
+            P.ready.push({ id: it.id, el, w: el.width, h: el.height });
+          } catch (e) {
+            it.bad = true; // (the browser can't read it – left out)
+            console.warn("[PMV Generator] picture", it.path, e);
+          }
+        })
+      );
+    } catch (e) {
+      console.warn("[PMV Generator] pictures", e);
+    } finally {
+      P.busy = false;
+    }
+  }
+
+  // A picture to show: a new one when there is one, else one that was shown before
+  takePic() {
+    const P = this.pics;
+    if (!P || P.dead) return null;
+    if (P.ready.length < 10) this.topUpPics();
+    if (!P.ready.length) return P.spent.length ? P.spent[Math.floor(Math.random() * P.spent.length)] : null;
+    const pic = P.ready.splice(Math.floor(Math.random() * P.ready.length), 1)[0];
+    P.spent.push(pic);
+    while (P.spent.length > 24) P.spent.shift(); // (dropped ones are left to the garbage collector – one may still be on screen)
+    return pic;
+  }
+
+  // On every beat: does a flash or an overlay start here?
+  picBeat(k, e, bar, len) {
+    const S = this.S;
+    const P = this.pics;
+    const beats = this.song.beats;
+    const t0 = beats[k];
+    if (S.picFlash && t0 >= P.flashUntil && Math.random() * 100 < (+S.picFlashPct || 0)) {
+      const rate = S.picFlashRate === "auto" ? (e > 0.72 ? 4 : e > 0.4 ? 2 : 1) : Math.max(1, Number(S.picFlashRate) || 1);
+      const step = len / rate;
+      const burst = S.picFlashMode === "burst" || (S.picFlashMode !== "single" && Math.random() < 0.5);
+      const n = burst ? Math.max(1, Math.round((+S.picFlashLen || 2) * rate)) : 1;
+      for (let i = 0; i < n; i++) this.events.push({ t: t0 + i * step, type: "pic", kind: "flash", dur: step * 0.96 });
+      P.flashUntil = t0 + n * step;
+      this.events.sort((a, b) => a.t - b.t);
+    }
+    // The overlay starts on the first beat of a bar (every beat if there are no bars); it doesn't start while another is on
+    if (S.picOverlay && (this.bars ? bar : k % 4 === 0) && t0 >= P.overUntil && Math.random() * 100 < (+S.picOverlayPct || 0)) {
+      const n = Math.max(1, Math.round(+S.picOverlayLen || 4));
+      const dur = (beats[k + n] != null ? beats[k + n] : t0 + n * len) - t0;
+      P.overUntil = t0 + dur;
+      this.events.push({ t: t0, type: "pic", kind: "over", dur });
+      this.events.sort((a, b) => a.t - b.t);
+    }
+  }
+
+  // The moment of a picture: take one and hand it to the picture on the screen
+  picFire(ev, t) {
+    const rest = ev.t + ev.dur - this.pos(); // (a frame that came late: what is over by now isn't shown)
+    if (rest <= 0.01) return;
+    const pic = this.takePic();
+    if (!pic) return;
+    if (ev.kind === "flash") this.comp.picFlash(pic, t, t + rest);
+    else this.comp.picOver(pic, t, t + rest, Math.max(0.1, Math.min(0.9, (+this.S.picOverlayAmt || 35) / 100)));
+  }
+
 
   // Speed ramps: playback rate of all running clips; a burst (hold) lasts briefly
   setRate(rate, hold) {
@@ -2787,7 +3702,7 @@ class Generator {
     if (!hold && this.rateHold && now < this.rateHold) return;
     this.rateHold = hold ? now + hold * 1000 : 0;
     this.rate = rate;
-    this.videos().forEach((m) => (m.el.playbackRate = rate));
+    this.videos().forEach((m) => (m.el.playbackRate = rate * (m.tempo || 1) * (m.sync || 1)));
   }
 
   // Hook a clip's audio into the mix (once per clip); goes through master, so into the recording too
@@ -2941,6 +3856,7 @@ class Generator {
 
   stopEverything() {
     this.done = true;
+    this.closeMoments();
     if (this.fsHandy) {
       this.fsHandy.stop();
       this.fsHandy = null;
@@ -2960,6 +3876,12 @@ class Generator {
     this.groups = [];
     this.ready.forEach((m) => this.release(m));
     this.ready = [];
+    if (this.pics) {
+      this.pics.dead = true;
+      [...this.pics.ready, ...this.pics.spent].forEach((p) => p.el.close && p.el.close());
+      this.pics.ready = [];
+      this.pics.spent = [];
+    }
   }
   async finish(early) {
     if (this.done) return;
@@ -3063,6 +3985,19 @@ const mediaError = (err) =>
 function withTimeout(p, ms) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("Timed out")), ms))]);
 }
+// The same address with a marker of its own (a second, separate load of the same file)
+function copyUrl(url, n) {
+  if (/^blob:/i.test(url)) return url.split("#")[0] + "#pmvcopy=" + n; // (a blob address has no query – only a fragment keeps it valid)
+  try {
+    const u = new URL(url, location.href);
+    u.searchParams.set("pmvcopy", n);
+    return u.href;
+  } catch (e) {
+    return url;
+  }
+}
+// What the moments you pinned are kept under: the file's path (the ids of the library are new in every visit)
+const pinKey = (x) => x.file || x.key;
 const fileName = (s) => ("PMV - " + s).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 100);
 
 function shuffle(a) {

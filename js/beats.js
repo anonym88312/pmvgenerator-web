@@ -3,6 +3,7 @@
 // 2. Tempo: autocorrelation of the onset curve, weighted around 120 BPM (against octave errors).
 // 3. Beats: dynamic programming after D. Ellis (2007) – follows small tempo fluctuations.
 // 4. Energy per beat (0–1): this gives the calm parts and the drops.
+// 5. Pace per beat (0–1): how busy the music is – hi-hats, fills and drum rolls feel faster at the same tempo.
 //
 // Long files (DJ mixes, over 45 min): decoding the whole thing at once needs ~2.5 GB for two hours –
 // more than a browser allows. Those are read piece by piece (WAV directly, MP3 in frame-aligned
@@ -78,7 +79,7 @@ export function songFromFrames(F, from = 0, to = Infinity) {
     for (let j = i * per, end = Math.min(n, j + per); j < end; j++) m = Math.max(m, F.peak[a + j]);
     peaks[i] = m;
   }
-  return { duration: n / fps, bpm: (60 * fps) / P, beats: beats.map((f) => f / fps), energy: normEnergy(rms), peaks, long: true };
+  return { duration: n / fps, bpm: (60 * fps) / P, beats: beats.map((f) => f / fps), energy: normEnergy(rms), pace: beatPace(onset, beats, P), peaks, long: true };
 }
 
 function mediaDuration(file) {
@@ -329,13 +330,15 @@ export async function analyzeBuffer(buf) {
   const n = Math.floor(mono.length / HOP);
   const onset = onsetCurve(frameEnergy(low, n), frameEnergy(mono, n), fps);
   const period = estimatePeriod(onset, fps);
-  const beats = trackBeats(onset, period).map((f) => (f * HOP) / sr);
+  const frames = trackBeats(onset, period);
+  const beats = frames.map((f) => (f * HOP) / sr);
   return {
     buffer: buf,
     duration: buf.duration,
     bpm: (60 * fps) / period,
     beats,
     energy: beatEnergy(mono, sr, beats),
+    pace: beatPace(onset, frames, period),
     peaks: overview(mono, 800),
   };
 }
@@ -351,7 +354,7 @@ export function rescale(song, factor) {
       if (i + 1 < b.length) beats.push((b[i] + b[i + 1]) / 2);
     }
   } else beats = b.filter((_, i) => i % 2 === 0);
-  return Object.assign({}, song, { beats, bpm: song.bpm * factor, energy: resampleEnergy(song.energy, beats.length) });
+  return Object.assign({}, song, { beats, bpm: song.bpm * factor, energy: resampleEnergy(song.energy, beats.length), pace: song.pace && resampleEnergy(song.pace, beats.length) });
 }
 
 // Shift the beat grid (seconds), e.g. when the cuts come slightly too early
@@ -494,6 +497,17 @@ function beatEnergy(mono, sr, beats) {
     return Math.sqrt(s / Math.max(1, b - a));
   });
   return normEnergy(rms);
+}
+
+// How busy each beat is: the mean onset strength between it and the next (frames) → 0–1 like the energy
+function beatPace(onset, frames, period) {
+  const busy = frames.map((f, k) => {
+    const end = Math.min(onset.length, frames[k + 1] ?? f + Math.round(period));
+    let s = 0;
+    for (let i = f; i < end; i++) s += onset[i];
+    return s / Math.max(1, end - f);
+  });
+  return normEnergy(busy);
 }
 
 // Loudness per beat → 0–1 (10th to 95th percentile), smoothed over a bar
