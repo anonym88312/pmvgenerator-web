@@ -1,4 +1,4 @@
-# PMV Generator – web version (2.38.7)
+# PMV Generator – web version (2.38.10)
 
 Pick a song and a folder of clips – on every beat it cuts to the next one: split-screen layouts like real PMVs, effects on cuts, beats and drops, beat-synced speed ramps and clip audio. It runs live in the browser and can record the result as a video. It can also analyze an existing PMV and rebuild it with your own clips.
 
